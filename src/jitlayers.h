@@ -11,6 +11,8 @@
 
 #include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
 #include <llvm/ExecutionEngine/Orc/IRTransformLayer.h>
+#include <llvm/ExecutionEngine/Orc/CompileOnDemandLayer.h>
+#include <llvm/ExecutionEngine/Orc/EPCIndirectionUtils.h>
 #include <llvm/ExecutionEngine/JITEventListener.h>
 
 #include <llvm/Passes/PassBuilder.h>
@@ -41,7 +43,7 @@
 // and feature support (e.g. Windows, JITEventListeners for various profilers,
 // etc.). Thus, we currently only use JITLink where absolutely required, that is,
 // for Mac/aarch64.
-#if defined(_OS_DARWIN_) && defined(_CPU_AARCH64_)
+#if defined(_OS_DARWIN_) && defined(_CPU_AARCH64_) || defined(_OS_LINUX_) && defined(_CPU_X86_64_)
 # if JL_LLVM_VERSION < 130000
 #  pragma message("On aarch64-darwin, LLVM version >= 13 is required for JITLink; fallback suffers from occasional segfaults")
 # endif
@@ -53,6 +55,10 @@
 #else
 # include <llvm/ExecutionEngine/RTDyldMemoryManager.h>
 # include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
+#endif
+
+#ifdef JL_USE_JITLINK
+#define JL_USE_ORC_COD
 #endif
 
 using namespace llvm;
@@ -264,6 +270,7 @@ public:
 #endif
     typedef orc::IRCompileLayer CompileLayerT;
     typedef orc::IRTransformLayer OptimizeLayerT;
+    typedef orc::CompileOnDemandLayer CODLayerT;
     typedef object::OwningBinary<object::ObjectFile> OwningObj;
     template
     <typename ResourceT, size_t max = 0,
@@ -418,6 +425,10 @@ public:
     uint64_t getGlobalValueAddress(StringRef Name);
     uint64_t getFunctionAddress(StringRef Name);
     StringRef getFunctionAtAddress(uint64_t Addr, jl_code_instance_t *codeinst);
+    void registerFunction(StringRef Name, JITTargetAddress Addr);
+    StringRef lookupFunction(JITTargetAddress Addr);
+    JITTargetAddress compileFunction(StringRef Name);
+    JITTargetAddress getCompiledFunction(JITTargetAddress Addr);
     auto getContext() {
         return *ContextPool;
     }
@@ -464,13 +475,17 @@ private:
     orc::ExecutionSession ES;
     orc::JITDylib &GlobalJD;
     orc::JITDylib &JD;
+#ifdef JL_USE_ORC_COD
+    std::atomic<orc::JITDylib *> CODJD;
+    std::unique_ptr<orc::EPCIndirectionUtils> EPCIU;
+#endif
 
     JITDebugInfoRegistry DebugRegistry;
 
     //Map and inc are guarded by RLST_mutex
     std::mutex RLST_mutex{};
     int RLST_inc = 0;
-    DenseMap<void*, std::string> ReverseLocalSymbolTable;
+    DenseMap<void*, orc::SymbolStringPtr> ReverseLocalSymbolTable;
 
     //Compilation streams
     jl_locked_stream dump_emitted_mi_name_stream;
@@ -485,6 +500,9 @@ private:
     ObjLayerT ObjectLayer;
     const std::array<std::unique_ptr<PipelineT>, 4> Pipelines;
     OptSelLayerT OptSelLayer;
+#ifdef JL_USE_ORC_COD
+    CODLayerT CODLayer;
+#endif
 };
 extern JuliaOJIT *jl_ExecutionEngine;
 orc::ThreadSafeModule jl_create_llvm_module(StringRef name, orc::ThreadSafeContext ctx, bool imaging_mode, const DataLayout &DL = jl_ExecutionEngine->getDataLayout(), const Triple &triple = jl_ExecutionEngine->getTargetTriple());

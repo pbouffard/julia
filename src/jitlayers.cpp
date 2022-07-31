@@ -184,14 +184,18 @@ static jl_callptr_t _jl_compile_codeinst(
             // once set, don't change invoke-ptr, as that leads to race conditions
             // with the (not) simultaneous updates to invoke and specptr
             if (!decls.specFunctionObject.empty()) {
-                jl_atomic_store_release(&this_code->specptr.fptr, (void*)getAddressForFunction(decls.specFunctionObject));
+                auto specAddr = getAddressForFunction(decls.specFunctionObject);
+                jl_ExecutionEngine->registerFunction(decls.specFunctionObject, specAddr);
+                jl_atomic_store_release(&this_code->specptr.fptr, jitTargetAddressToPointer<void*>(specAddr));
                 this_code->isspecsig = isspecsig;
             }
             jl_atomic_store_release(&this_code->invoke, addr);
         }
         else if (jl_atomic_load_relaxed(&this_code->invoke) == jl_fptr_const_return_addr && !decls.specFunctionObject.empty()) {
             // hack to export this pointer value to jl_dump_method_disasm
-            jl_atomic_store_release(&this_code->specptr.fptr, (void*)getAddressForFunction(decls.specFunctionObject));
+            auto specAddr = getAddressForFunction(decls.specFunctionObject);
+            jl_ExecutionEngine->registerFunction(decls.specFunctionObject, specAddr);
+            jl_atomic_store_release(&this_code->specptr.fptr, jitTargetAddressToPointer<void*>(specAddr));
         }
         if (this_code== codeinst)
             fptr = addr;
@@ -428,7 +432,7 @@ jl_value_t *jl_dump_method_asm_impl(jl_method_instance_t *mi, size_t world,
     if (codeinst) {
         uintptr_t fptr = (uintptr_t)jl_atomic_load_relaxed(&codeinst->invoke);
         if (getwrapper)
-            return jl_dump_fptr_asm(fptr, raw_mc, asm_variant, debuginfo, binary);
+            return jl_dump_fptr_asm(jl_ExecutionEngine->getCompiledFunction(fptr), raw_mc, asm_variant, debuginfo, binary);
         uintptr_t specfptr = (uintptr_t)jl_atomic_load_relaxed(&codeinst->specptr.fptr);
         if (fptr == (uintptr_t)jl_fptr_const_return_addr && specfptr == 0) {
             // normally we prevent native code from being generated for these functions,
@@ -469,7 +473,7 @@ jl_value_t *jl_dump_method_asm_impl(jl_method_instance_t *mi, size_t world,
             JL_UNLOCK(&jl_codegen_lock);
         }
         if (specfptr != 0)
-            return jl_dump_fptr_asm(specfptr, raw_mc, asm_variant, debuginfo, binary);
+            return jl_dump_fptr_asm(jl_ExecutionEngine->getCompiledFunction(specfptr), raw_mc, asm_variant, debuginfo, binary);
     }
 
     // whatever, that didn't work - use the assembler output instead
@@ -498,6 +502,12 @@ static auto countBasicBlocks(const Function &F)
 
 void JuliaOJIT::OptSelLayerT::emit(std::unique_ptr<orc::MaterializationResponsibility> R, orc::ThreadSafeModule TSM) {
     size_t optlevel = SIZE_MAX;
+    //We may enter compilation here, which may clobber errno/LastError
+    //Pretend like nothing happened
+    int last_errno = errno;
+#ifdef _OS_WINDOWS_
+    DWORD last_error = GetLastError();
+#endif
     TSM.withModuleDo([&](Module &M) {
         if (jl_generating_output()) {
             optlevel = 0;
@@ -521,6 +531,10 @@ void JuliaOJIT::OptSelLayerT::emit(std::unique_ptr<orc::MaterializationResponsib
     });
     assert(optlevel != SIZE_MAX && "Failed to select a valid optimization level!");
     this->optimizers[optlevel]->OptimizeLayer.emit(std::move(R), std::move(TSM));
+#ifdef _OS_WINDOWS_
+    SetLastError(last_error);
+#endif
+    errno = last_errno;
 }
 
 void jl_register_jit_object(const object::ObjectFile &debugObj,
@@ -1010,6 +1024,15 @@ namespace {
 
         JuliaOJIT::ResourcePool<std::unique_ptr<TargetMachine>> TMs;
     };
+
+#ifdef JL_USE_ORC_COD
+    auto createEPCIU(orc::ExecutionSession &ES) {
+        auto EPCIU = cantFail(orc::EPCIndirectionUtils::Create(ES.getExecutorProcessControl()));
+        EPCIU->createLazyCallThroughManager(ES, 0);//TODO set error handler to something more interesting
+        cantFail(orc::setUpInProcessLCTMReentryViaEPCIU(*EPCIU));
+        return EPCIU;
+    }
+#endif
 }
 
 llvm::DataLayout jl_create_datalayout(TargetMachine &TM) {
@@ -1034,6 +1057,10 @@ JuliaOJIT::JuliaOJIT()
 #endif
     GlobalJD(ES.createBareJITDylib("JuliaGlobals")),
     JD(ES.createBareJITDylib("JuliaOJIT")),
+#ifdef JL_USE_ORC_COD
+    CODJD(nullptr),
+    EPCIU(createEPCIU(ES)),
+#endif
     ContextPool([](){
         auto ctx = std::make_unique<LLVMContext>();
 #ifdef JL_LLVM_OPAQUE_POINTERS
@@ -1066,6 +1093,9 @@ JuliaOJIT::JuliaOJIT()
         std::make_unique<PipelineT>(ObjectLayer, *TM, 3),
     },
     OptSelLayer(Pipelines)
+#ifdef JL_USE_ORC_COD
+    , CODLayer(ES, OptSelLayer, EPCIU->getLazyCallThroughManager(), [this](){ return EPCIU->createIndirectStubsManager(); })
+#endif
 {
 #ifdef JL_USE_JITLINK
 # if defined(LLVM_SHLIB)
@@ -1086,6 +1116,9 @@ JuliaOJIT::JuliaOJIT()
                const RuntimeDyld::LoadedObjectInfo &LO) {
             registerRTDyldJITObject(Object, LO, MemMgr);
         });
+#endif
+#ifdef JL_USE_ORC_COD
+    CODLayer.setPartitionFunction(CODLayerT::compileWholeModule);
 #endif
 
     // Make sure SectionMemoryManager::getSymbolAddressInProcess can resolve
@@ -1180,12 +1213,19 @@ void JuliaOJIT::addModule(orc::ThreadSafeModule TSM)
 #endif
     });
     // TODO: what is the performance characteristics of this?
-    cantFail(OptSelLayer.add(JD, std::move(TSM)));
+    cantFail(
+#ifdef JL_USE_ORC_COD
+        CODLayer
+#else
+        OptSelLayer
+#endif
+        .add(JD, std::move(TSM)));
     // force eager compilation (for now), due to memory management specifics
     // (can't handle compilation recursion)
+#ifndef JL_USE_JITLINK
     for (auto Name : NewExports)
         cantFail(ES.lookup({&JD}, Name));
-
+#endif
 }
 
 JL_JITSymbol JuliaOJIT::findSymbol(StringRef Name, bool ExportedSymbolsOnly)
@@ -1226,8 +1266,8 @@ uint64_t JuliaOJIT::getFunctionAddress(StringRef Name)
 StringRef JuliaOJIT::getFunctionAtAddress(uint64_t Addr, jl_code_instance_t *codeinst)
 {
     std::lock_guard<std::mutex> lock(RLST_mutex);
-    std::string *fname = &ReverseLocalSymbolTable[(void*)(uintptr_t)Addr];
-    if (fname->empty()) {
+    auto &fname = ReverseLocalSymbolTable[(void*)(uintptr_t)Addr];
+    if (!fname) {
         std::string string_fname;
         raw_string_ostream stream_fname(string_fname);
         // try to pick an appropriate name that describes it
@@ -1246,12 +1286,59 @@ StringRef JuliaOJIT::getFunctionAtAddress(uint64_t Addr, jl_code_instance_t *cod
         }
         const char* unadorned_name = jl_symbol_name(codeinst->def->def.method->name);
         stream_fname << unadorned_name << "_" << RLST_inc++;
-        *fname = std::move(stream_fname.str()); // store to ReverseLocalSymbolTable
+        fname = ES.intern(stream_fname.str());
         addGlobalMapping(*fname, Addr);
     }
     return *fname;
 }
 
+void JuliaOJIT::registerFunction(StringRef Name, JITTargetAddress Addr) {
+    std::lock_guard<std::mutex> lock(RLST_mutex);
+    assert(ReverseLocalSymbolTable.count(jitTargetAddressToPointer<void*>(Addr)) == 0 && "Tried to register two compiled functions at the same address!");
+    ReverseLocalSymbolTable[jitTargetAddressToPointer<void*>(Addr)] = ES.intern(Name);
+}
+
+StringRef JuliaOJIT::lookupFunction(JITTargetAddress Addr) {
+    std::lock_guard<std::mutex> lock(RLST_mutex);
+    auto &ptr = ReverseLocalSymbolTable[jitTargetAddressToPointer<void*>(Addr)];
+    return ptr ? *ptr : StringRef();
+}
+
+JITTargetAddress JuliaOJIT::compileFunction(StringRef Name) {
+#ifdef JL_USE_ORC_COD
+    auto implJD = CODJD.load(std::memory_order_relaxed);
+    if (!implJD) {
+        auto impl = ES.getJITDylibByName(JD.getName() + ".impl");
+        assert(impl && "Expected CODLayer to have created an impl dylib!");
+        if (!CODJD.compare_exchange_strong(implJD, impl, std::memory_order_relaxed)) {
+            assert(impl == implJD && "Found two JITDylibs for the same impl dylib!");
+        } else {
+            implJD = impl;
+        }
+    }
+    assert(implJD && "Expected to have a dylib to force compilation in!");
+    auto ptr = ES.lookup({implJD, &JD}, Name);
+    if (!ptr) {
+        ES.reportError(ptr.takeError());
+        return 0;
+    }
+    return ptr->getAddress();
+#else
+    return cantFail(ES.lookup({&JD}, Name)).getAddress();
+#endif
+}
+JITTargetAddress JuliaOJIT::getCompiledFunction(JITTargetAddress Addr) {
+#ifdef JL_USE_ORC_COD
+    auto name = lookupFunction(Addr);
+    if (name.empty()) {
+        return Addr;
+    }
+    auto compiled = compileFunction(name);
+    return compiled ? compiled : Addr;
+#else
+    return Addr;
+#endif
+}
 
 #ifdef JL_USE_JITLINK
 # if JL_LLVM_VERSION < 140000
